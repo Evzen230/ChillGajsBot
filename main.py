@@ -26,6 +26,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 conn = sqlite3.connect("hlasovani.db")
 cursor = conn.cursor()
+
+# --- DATABÁZOVÉ TABULKY ---
+# 1. Historie
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS historie_hlasovani (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,11 +40,42 @@ cursor.execute("""
         hlasu_proti INTEGER
     )
 """)
+
+# 2. Stav aktivního hlasování
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS aktivni_hlasovani (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        aktivni INTEGER,
+        tema TEXT,
+        autor_id INTEGER,
+        spusteno INTEGER
+    )
+""")
+
+# 3. Možnosti aktivního hlasování
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS aktivni_moznosti (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        moznost_index INTEGER,
+        text TEXT,
+        autor_id INTEGER
+    )
+""")
+
+# 4. Uložené hlasy uživatelů
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS aktivni_hlasy (
+        user_id INTEGER,
+        moznost_index INTEGER,
+        volba TEXT,
+        PRIMARY KEY (user_id, moznost_index)
+    )
+""")
 conn.commit()
 
 deleted_messages_cache = {}
 
-# Jeden jediný globální stav hlasování pro celého bota
+# Globální stav v paměti (načítá se z DB)
 hlasovani = {
     "aktivni": False, 
     "tema": "", 
@@ -50,6 +84,74 @@ hlasovani = {
     "auto_ukoncit_task": None, 
     "spusteno": False
 }
+
+
+# --- POMOCNÉ DATABÁZOVÉ FUNKCE ---
+
+def ulozit_stav_do_db():
+    """Uloží kompletní stav z paměti do SQLite databáze."""
+    cursor.execute("DELETE FROM aktivni_hlasovani")
+    cursor.execute("DELETE FROM aktivni_moznosti")
+    
+    if hlasovani["aktivni"]:
+        cursor.execute(
+            "INSERT INTO aktivni_hlasovani (id, aktivni, tema, autor_id, spusteno) VALUES (1, 1, ?, ?, ?)",
+            (hlasovani["tema"], hlasovani["autor_id"], 1 if hlasovani["spusteno"] else 0)
+        )
+        for idx, m in enumerate(hlasovani["moznosti"]):
+            cursor.execute(
+                "INSERT INTO aktivni_moznosti (moznost_index, text, autor_id) VALUES (?, ?, ?)",
+                (idx, m["text"], m["autor_id"])
+            )
+    conn.commit()
+
+
+def nacti_stav_z_db():
+    """Při startu bota načte uložené hlasování z DB zpět do paměti RAM."""
+    cursor.execute("SELECT tema, autor_id, spusteno FROM aktivni_hlasovani WHERE id = 1 AND aktivni = 1")
+    row = cursor.fetchone()
+    
+    if not row:
+        return
+
+    tema, autor_id, spusteno = row
+    hlasovani["aktivni"] = True
+    hlasovani["tema"] = tema
+    hlasovani["autor_id"] = autor_id
+    hlasovani["spusteno"] = bool(spusteno)
+    hlasovani["moznosti"] = []
+
+    cursor.execute("SELECT moznost_index, text, autor_id FROM aktivni_moznosti ORDER BY moznost_index ASC")
+    moznosti_rows = cursor.fetchall()
+
+    for idx, text, m_autor_id in moznosti_rows:
+        # Načtení hlasů pro konkrétní možnost
+        cursor.execute("SELECT user_id, volba FROM aktivni_hlasy WHERE moznost_index = ?", (idx,))
+        hlasy_rows = cursor.fetchall()
+        
+        pro = set()
+        proti = set()
+        zdrzel = set()
+        
+        for uid, volba in hlasy_rows:
+            if volba == "pro": pro.add(uid)
+            elif volba == "proti": proti.add(uid)
+            elif volba == "zdrzelse": zdrzel.add(uid)
+
+        hlasovani["moznosti"].append({
+            "text": text,
+            "autor_id": m_autor_id,
+            "hlasy": {"pro": pro, "proti": proti, "zdrzelse": zdrzel}
+        })
+
+
+def vymaz_stav_z_db():
+    """Smaže aktivní hlasování i hlasy z DB po dokončení/zrušení."""
+    cursor.execute("DELETE FROM aktivni_hlasovani")
+    cursor.execute("DELETE FROM aktivni_moznosti")
+    cursor.execute("DELETE FROM aktivni_hlasy")
+    conn.commit()
+
 
 def spravny_kanal(interaction: discord.Interaction) -> bool:
     return interaction.channel_id == HLASOVANI_KANAL_ID
@@ -153,6 +255,7 @@ class MoznostModal(discord.ui.Modal, title="Přidat možnost"):
             "autor_id": interaction.user.id,
             "hlasy": {"pro": set(), "proti": set(), "zdrzelse": set()},
         })
+        ulozit_stav_do_db()
         await interaction.response.send_message("Možnost přidána.", ephemeral=True)
 
 
@@ -175,6 +278,13 @@ class TajneHlasovaniView(discord.ui.View):
         for klic in hlasy:
             hlasy[klic].discard(user_id)
         hlasy[volba].add(user_id)
+        
+        # Uložení nového hlasu v reálném čase do SQLite
+        cursor.execute(
+            "INSERT OR REPLACE INTO aktivni_hlasy (user_id, moznost_index, volba) VALUES (?, ?, ?)",
+            (user_id, self.moznost_index, volba)
+        )
+        conn.commit()
 
     @discord.ui.button(emoji="🟩", label="Hlasovat pro", style=discord.ButtonStyle.success)
     async def btn_pro(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -221,6 +331,8 @@ async def hlasovani_zahajit(interaction: discord.Interaction, tema: str, reseni:
         "auto_ukoncit_task": None,
         "spusteno": bool(moznosti),
     })
+    
+    ulozit_stav_do_db()
 
     popis = f"**Téma:** {tema}\nZaložil: {interaction.user.mention}"
     if cas_dny:
@@ -256,6 +368,8 @@ async def hlasovani_jednoduche(interaction: discord.Interaction, tema: str, rese
         "auto_ukoncit_task": None,
         "spusteno": True,
     })
+
+    ulozit_stav_do_db()
 
     popis = f"**Problematika:** {tema}\n**Řešení:** {reseni}\nZaložil: {interaction.user.mention}"
     if cas_dny:
@@ -295,6 +409,8 @@ async def hlasovani_spustit(interaction: discord.Interaction):
         return
 
     hlasovani["spusteno"] = True
+    ulozit_stav_do_db()
+
     await interaction.response.send_message(f"**Hlasování spuštěno**\nTéma: {hlasovani['tema']}")
     for index, moznost in enumerate(hlasovani["moznosti"]):
         embed = discord.Embed(title=f"Možnost č. {index + 1}", description=moznost["text"], color=discord.Color.gold())
@@ -351,6 +467,7 @@ def zresetuj_hlasovani():
     if task and not task.done():
         task.cancel()
     hlasovani.update({"aktivni": False, "tema": "", "moznosti": [], "autor_id": None, "auto_ukoncit_task": None, "spusteno": False})
+    vymaz_stav_z_db()
 
 
 @bot.tree.command(name="hlasovani_3_ukoncit", description="Ukončí hlasování a uloží výsledek")
@@ -484,17 +601,13 @@ async def sraz(interaction: discord.Interaction):
 
 @bot.tree.command(name="clear", description="Smaže veškerý obsah tohoto kanálu (pouze pro majitele)")
 async def clear_channel(interaction: discord.Interaction):
-    # Kontrola, zda příkaz spouští oprávněný uživatel
     if interaction.user.id != 1548780627602444369:
         await interaction.response.send_message("❌ Na tento příkaz nemáš oprávnění.", ephemeral=True)
         return
 
-    # Defer je důležitý, protože mazání velkého množství zpráv může trvat 
-    # déle než 3 sekundy, což by jinak vyvolalo timeout chybu u interakce.
     await interaction.response.defer(ephemeral=True)
 
     try:
-        # purge(limit=None) projde a smaže všechny dostupné zprávy v kanálu
         deleted = await interaction.channel.purge(limit=None)
         await interaction.followup.send(f"✅ Kanál byl vyčištěn. Smazáno zpráv: {len(deleted)}", ephemeral=True)
     except discord.Forbidden:
@@ -506,7 +619,8 @@ async def clear_channel(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"Bot {bot.user} je online.")
+    nacti_stav_z_db()  # Načte probíhající hlasování z databáze po startu
+    print(f"Bot {bot.user} je online. Načteno probíhající hlasování z DB: {hlasovani['aktivni']}")
 
 
 if TOKEN is None:
